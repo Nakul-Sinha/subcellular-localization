@@ -36,7 +36,12 @@ from torch.utils.data import Dataset, DataLoader
 warnings.filterwarnings("ignore")
 
 # ----------------------------- config -----------------------------
-DATA_ROOT = Path(os.environ.get("DATA_ROOT", "./dataset/public"))
+# auto-detect the dataset root: works whether the platform places data at
+# ./dataset/public/ (Eris convention) or directly in the working dir (this
+# challenge's description). First candidate containing train.csv wins.
+DATA_ROOT = Path(os.environ.get("DATA_ROOT") or next(
+    (c for c in ["./dataset/public", ".", "./input", "./data", "./dataset"]
+     if (Path(c) / "train.csv").exists()), "./dataset/public"))
 OUT_DIR   = Path(os.environ.get("OUT_DIR", "./working"))
 BACKBONE  = os.environ.get("BACKBONE", "convnextv2_tiny.fcmae_ft_in22k_in1k")
 TEXT_MODEL= os.environ.get("TEXT_MODEL", "microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext")
@@ -299,6 +304,7 @@ def apply_bias(prob, bias):
 # ----------------------------- main -----------------------------
 def main():
     log(f"config: backbone={BACKBONE} use_text={USE_TEXT} loss={LOSS} folds={N_FOLDS} epochs={EPOCHS} img={IMG_SIZE} batch={BATCH} fast={FAST} device={DEVICE}")
+    log(f"DATA_ROOT={DATA_ROOT.resolve()}  OUT_DIR={OUT_DIR.resolve()}")
     tr = pd.read_csv(DATA_ROOT / "train.csv")
     te = pd.read_csv(DATA_ROOT / "test.csv")
     if FAST:
@@ -343,6 +349,7 @@ def main():
         sub = pd.DataFrame({"id": te["id"].values})
         for j, c in enumerate(LOC_COLS): sub[c] = test_final[:, j]
         sub.to_csv(OUT_DIR / "submission.csv", index=False)
+        sub.to_csv("submission.csv", index=False)  # also write to cwd for platform compatibility
         np.save(OUT_DIR / "oof.npy", oof); np.save(OUT_DIR / "bias.npy", bias)
         json.dump({"folds_done": int(n_used), "raw_f1_05": raw_global, "raw_f1_bias": raw_biased,
                    "locskill_05": loc_skill(raw_global), "locskill_bias": loc_skill(raw_biased),
