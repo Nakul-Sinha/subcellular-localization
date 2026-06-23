@@ -1,30 +1,3 @@
-"""
-Multi-Label Subcellular Localization from Microscopy + Function Text
-Official submission script. Two-encoder vision+text fusion -> 16-way sigmoid
-head, leave-family-out CV. Run `python solution.py` (no args) to reproduce the
-shipped submission.csv: it reads ./dataset/public/ and writes ./working/submission.csv.
-
-The defaults below ARE the validated winning config (H100 leave-family-out OOF:
-rawF1 0.457 / LocSkill 0.433). Every loc_<class> value is produced by the trained
-deep model (no classical ML, no hardcoding, no metadata). All knobs are overridable
-via env vars for research:
-  DATA_ROOT   path containing train.csv/test.csv/train/*.npy  (default ./dataset/public)
-  OUT_DIR     output dir for submission.csv + artifacts        (default ./working)
-  BACKBONE    timm vision backbone                             (default convnextv2_tiny.fcmae_ft_in22k_in1k)
-  TEXT_MODEL  HF text encoder                                  (default microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext)
-  USE_TEXT    1/0 enable text branch                           (default 1)
-  LOSS        bce | asl                                        (default bce)
-  N_FOLDS     leave-family-out folds                           (default 3)
-  EPOCHS      epochs per fold                                  (default 18)
-  IMG_SIZE    train/infer image size                          (default 320)
-  BATCH       batch size                                       (default 48, fits 24GB)
-  TTA         1/0 D4 test-time augmentation                   (default 1)
-  FAST        1 = smoke test (1 fold, 1 epoch, subset)        (default 0)
-  SEED        random seed                                      (default 42)
-
-Requires: torch, timm, transformers<5 (>=5 needs torch>=2.6 to load PubMedBERT .bin),
-scikit-learn, iterative-stratification, albumentations, pandas, numpy. See requirements.md.
-"""
 import os, json, math, time, random, warnings
 from pathlib import Path
 import numpy as np
@@ -35,10 +8,6 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 warnings.filterwarnings("ignore")
 
-# ----------------------------- config -----------------------------
-# auto-detect the dataset root: works whether the platform places data at
-# ./dataset/public/ (Eris convention) or directly in the working dir (this
-# challenge's description). First candidate containing train.csv wins.
 DATA_ROOT = Path(os.environ.get("DATA_ROOT") or next(
     (c for c in ["./dataset/public", ".", "./input", "./data", "./dataset"]
      if (Path(c) / "train.csv").exists()), "./dataset/public"))
@@ -76,17 +45,14 @@ set_seed(SEED)
 def log(*a):
     print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
 
-# ----------------------------- data -----------------------------
 def load_npy_cache(ids, split):
-    """Preload all images into RAM as float32 (channel-percentile-normalized)."""
     cache = {}
     for i in ids:
-        a = np.load(DATA_ROOT / split / f"{i}.npy").astype(np.float32)  # (2,H,W)
+        a = np.load(DATA_ROOT / split / f"{i}.npy").astype(np.float32)
         cache[i] = a
     return cache
 
 def norm_img(a):
-    """Per-channel 1-99.5 percentile contrast stretch -> [0,1], then standardize."""
     out = np.empty_like(a)
     for c in range(a.shape[0]):
         ch = a[c]
@@ -103,7 +69,6 @@ class ProtDataset(Dataset):
         self.has_y = LOC_COLS[0] in self.df.columns
         if self.has_y:
             self.Y = self.df[LOC_COLS].values.astype(np.float32)
-        # pre-tokenize
         texts = self.df["function_text"].fillna("").tolist()
         enc = tok(texts, truncation=True, max_length=MAX_LEN, padding="max_length", return_tensors="np")
         self.input_ids = enc["input_ids"].astype(np.int64)
@@ -112,12 +77,10 @@ class ProtDataset(Dataset):
     def __len__(self): return len(self.df)
 
     def _aug(self, img):
-        # D4 dihedral: random flips + 90-deg rotations (microscopy is rotation-invariant)
         if random.random() < 0.5: img = img[:, ::-1, :]
         if random.random() < 0.5: img = img[:, :, ::-1]
         k = random.randint(0, 3)
         if k: img = np.rot90(img, k, axes=(1, 2))
-        # mild brightness/contrast jitter for dark images
         if random.random() < 0.5:
             g = 1.0 + (random.random() - 0.5) * 0.3
             img = np.clip(img * g, 0, 1)
@@ -134,7 +97,6 @@ class ProtDataset(Dataset):
         if self.has_y: item["y"] = torch.from_numpy(self.Y[idx])
         return item
 
-# ----------------------------- model -----------------------------
 import timm
 from transformers import AutoModel, AutoTokenizer
 
@@ -162,7 +124,7 @@ class FusionModel(nn.Module):
         if self.use_text:
             out = self.text(input_ids=input_ids, attention_mask=attn).last_hidden_state
             mask = attn.unsqueeze(-1).float()
-            tv = (out * mask).sum(1) / mask.sum(1).clamp(min=1e-6)   # masked mean pool
+            tv = (out * mask).sum(1) / mask.sum(1).clamp(min=1e-6)
             tv = self.txt_proj(tv)
             txt_logits = self.txt_head(tv)
             if self.training and text_drop_p > 0:
@@ -172,7 +134,6 @@ class FusionModel(nn.Module):
             return fused, img_logits, txt_logits
         return self.head(iv), img_logits, None
 
-# ----------------------------- loss -----------------------------
 class ASL(nn.Module):
     def __init__(self, gamma_neg=4, gamma_pos=0, clip=0.05, eps=1e-8):
         super().__init__(); self.gn, self.gp, self.clip, self.eps = gamma_neg, gamma_pos, clip, eps
@@ -193,9 +154,15 @@ def make_loss(pos_weight):
     bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     return lambda logits, y: bce(logits, y)
 
-# ----------------------------- metric -----------------------------
 from sklearn.metrics import f1_score
-F1_BASE = 0.043  # predict-only-nucleoplasm anchor (computed on train)
+F1_BASE = 0.0
+
+def compute_f1_base(Yh):
+    prev = Yh.mean(0)
+    base_row = (prev >= 0.5).astype(int)
+    f1s = [f1_score(Yh[:, j], np.full(len(Yh), base_row[j]), zero_division=0)
+           for j in range(16) if Yh[:, j].sum() > 0]
+    return float(np.mean(f1s)) if f1s else 0.0
 
 def raw_macro_f1(y_true, y_prob, thr=0.5):
     yt = (y_true >= 0.5).astype(int); yp = (y_prob >= thr).astype(int)
@@ -204,7 +171,6 @@ def raw_macro_f1(y_true, y_prob, thr=0.5):
 
 def loc_skill(raw): return float(np.clip((raw - F1_BASE) / (1 - F1_BASE), 0, 1))
 
-# ----------------------------- EMA -----------------------------
 class EMA:
     def __init__(self, model, decay=0.999):
         self.decay = decay
@@ -217,7 +183,6 @@ class EMA:
                 self.shadow[k] = v.detach().clone()
     def copy_to(self, model): model.load_state_dict(self.shadow, strict=True)
 
-# ----------------------------- train one fold -----------------------------
 def train_fold(tr_df, va_df, cache, tok, pos_weight, tag=""):
     model = FusionModel(BACKBONE, USE_TEXT).to(DEVICE)
     crit = make_loss(pos_weight.to(DEVICE))
@@ -237,7 +202,7 @@ def train_fold(tr_df, va_df, cache, tok, pos_weight, tag=""):
     def lr_lambda(s):
         if s < warmup: return s / warmup
         prog = (s - warmup) / max(1, steps - warmup)
-        return 0.5 * (1 + math.cos(math.pi * prog))   # cosine decay, holds peak LR longer than OneCycle
+        return 0.5 * (1 + math.cos(math.pi * prog))
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
     scaler = torch.cuda.amp.GradScaler()
     ema = EMA(model, 0.999)
@@ -253,7 +218,6 @@ def train_fold(tr_df, va_df, cache, tok, pos_weight, tag=""):
             scaler.scale(loss).backward(); scaler.step(opt); scaler.update(); sched.step()
             ema.update(model)
         log(f"  {tag} epoch {ep+1}/{EPOCHS} loss {loss.item():.4f}")
-    # validate with EMA weights
     eval_model = FusionModel(BACKBONE, USE_TEXT).to(DEVICE); ema.copy_to(eval_model); eval_model.eval()
     va_prob = predict(eval_model, va_dl, tta=False)
     return ema.shadow, va_prob
@@ -276,16 +240,13 @@ def predict(model, dl, tta=True):
         probs.append((acc / len(flips)).cpu().numpy())
     return np.concatenate(probs, 0)
 
-# ----------------------------- threshold lever -----------------------------
 def fit_logit_bias(oof_prob, oof_true):
-    """Per-class: find F1-optimal threshold t_c on OOF, return logit bias b_c=-logit(t_c)
-       so the grader's fixed 0.5 lands at t_c. Rare classes use prevalence matching."""
     yt = (oof_true >= 0.5).astype(int)
     bias = np.zeros(16, dtype=np.float32)
     for j in range(16):
         p = oof_prob[:, j]; t = yt[:, j]
         prev = t.mean()
-        if t.sum() < 10:   # rare: prevalence-match the positive-prediction rate
+        if t.sum() < 10:
             q = np.quantile(p, 1 - max(prev, 1e-3))
             tc = float(np.clip(q, 0.05, 0.95))
         else:
@@ -301,8 +262,8 @@ def apply_bias(prob, bias):
     logit = np.log(np.clip(prob, 1e-6, 1 - 1e-6) / (1 - np.clip(prob, 1e-6, 1 - 1e-6)))
     return 1 / (1 + np.exp(-(logit + bias[None, :])))
 
-# ----------------------------- main -----------------------------
 def main():
+    global F1_BASE
     log(f"config: backbone={BACKBONE} use_text={USE_TEXT} loss={LOSS} folds={N_FOLDS} epochs={EPOCHS} img={IMG_SIZE} batch={BATCH} fast={FAST} device={DEVICE}")
     log(f"DATA_ROOT={DATA_ROOT.resolve()}  OUT_DIR={OUT_DIR.resolve()}")
     tr = pd.read_csv(DATA_ROOT / "train.csv")
@@ -313,18 +274,18 @@ def main():
     log(f"train {tr.shape} test {te.shape}")
     tok = AutoTokenizer.from_pretrained(TEXT_MODEL)
 
-    # pos_weight from hard prevalence
     Yh = (tr[LOC_COLS].values >= 0.5).astype(np.float32)
     pos = Yh.sum(0); neg = len(Yh) - pos
     pos_weight = torch.tensor(np.clip(neg / np.clip(pos, 1, None), 1, 10), dtype=torch.float32)
+    F1_BASE = compute_f1_base(Yh)
+    log(f"F1_base (computed from train) = {F1_BASE:.4f}")
 
-    log("loading image cache to RAM...")
+    log("loading image cache to RAM")
     tr_cache = load_npy_cache(tr["id"].tolist(), "train")
     te_cache = load_npy_cache(te["id"].tolist(), "test")
 
-    # leave-family-out folds
     from sklearn.model_selection import StratifiedGroupKFold
-    strat = Yh.argmax(1)  # dominant class for stratification proxy
+    strat = Yh.argmax(1)
     sgkf = StratifiedGroupKFold(n_splits=max(N_FOLDS, 2), shuffle=True, random_state=SEED)
     folds = list(sgkf.split(tr, strat, groups=tr["family_group_id"].values))
     if FAST: folds = folds[:1]
@@ -337,7 +298,6 @@ def main():
     te_dl = DataLoader(te_ds, batch_size=BATCH * 2, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
 
     def finalize(n_used):
-        """Compute OOF metric + threshold lever and write submission (incremental-safe)."""
         ofm = oof_mask
         if ofm.sum() == 0 or n_used == 0: return None
         test_prob = test_prob_acc / n_used
@@ -349,29 +309,29 @@ def main():
         sub = pd.DataFrame({"id": te["id"].values})
         for j, c in enumerate(LOC_COLS): sub[c] = test_final[:, j]
         sub.to_csv(OUT_DIR / "submission.csv", index=False)
-        sub.to_csv("submission.csv", index=False)  # also write to cwd for platform compatibility
+        sub.to_csv("submission.csv", index=False)
         np.save(OUT_DIR / "oof.npy", oof); np.save(OUT_DIR / "bias.npy", bias)
         json.dump({"folds_done": int(n_used), "raw_f1_05": raw_global, "raw_f1_bias": raw_biased,
                    "locskill_05": loc_skill(raw_global), "locskill_bias": loc_skill(raw_biased),
                    "config": {"backbone": BACKBONE, "use_text": USE_TEXT, "loss": LOSS,
                               "folds": N_FOLDS, "epochs": EPOCHS, "img": IMG_SIZE}},
                   open(OUT_DIR / "metrics.json", "w"), indent=2)
-        log(f"  [partial after {n_used} fold(s)] OOF rawF1 0.5={raw_global:.4f} +bias={raw_biased:.4f} "
-            f"LocSkill={loc_skill(raw_biased):.4f}  -> wrote submission {sub.shape}")
+        log(f"  [partial after {n_used} fold(s)] OOF rawF1 0.5={raw_global:.4f} bias={raw_biased:.4f} "
+            f"LocSkill={loc_skill(raw_biased):.4f} wrote submission {sub.shape}")
         return raw_biased
 
     for fi, (tri, vai) in enumerate(folds[:N_FOLDS]):
         t0 = time.time()
         tr_df, va_df = tr.iloc[tri], tr.iloc[vai]
-        log(f"=== fold {fi+1}/{N_FOLDS}  train {len(tr_df)} val {len(va_df)} (families disjoint) ===")
+        log(f"fold {fi+1}/{N_FOLDS} train {len(tr_df)} val {len(va_df)} families disjoint")
         weights, va_prob = train_fold(tr_df, va_df, tr_cache, tok, pos_weight, tag=f"f{fi}")
         oof[vai] = va_prob; oof_mask[vai] = True
         raw = raw_macro_f1(va_df[LOC_COLS].values, va_prob)
-        log(f"  fold {fi+1} OOF rawF1 {raw:.4f}  LocSkill {loc_skill(raw):.4f}  ({time.time()-t0:.0f}s)")
+        log(f"  fold {fi+1} OOF rawF1 {raw:.4f} LocSkill {loc_skill(raw):.4f} ({time.time()-t0:.0f}s)")
         m = FusionModel(BACKBONE, USE_TEXT).to(DEVICE); m.load_state_dict(weights); m.eval()
         test_prob_acc += predict(m, te_dl, tta=TTA); n_used += 1
         del m; torch.cuda.empty_cache()
-        finalize(n_used)   # incremental write: valid submission after every fold
+        finalize(n_used)
 
     log("DONE")
 
