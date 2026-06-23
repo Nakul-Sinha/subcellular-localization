@@ -345,6 +345,19 @@ Keep as an **orthogonal ensemble bet**, not the default:
   band; constant baseline ≈ 0; `F1_base ≈ 0.043`). Rare/secondary classes are the ceiling —
   HPA winners plateaued at AP ≈ 0.31–0.34 on weak classes even with 4 channels + external
   data.
+- **MEASURED (this solution, H100 leave-family-out OOF, StratifiedGroupKFold on `family_group_id`):**
+
+  | Run | Config | rawF1 @0.5 | rawF1 +bias | **LocSkill** |
+  |---|---|---|---|---|
+  | 1 | nano, 3-fold, 6 ep | 0.178 | 0.224 | 0.189 |
+  | 2 | nano, 3-fold, 16 ep | 0.305 | 0.369 | 0.341 |
+  | **3 (shipped)** | **tiny, 3-fold, 18 ep, BCE+pos_weight, EMA, D4 TTA** | 0.384 | **0.457** | **0.433** |
+
+  Run 3's **rawF1 0.457 is inside the stated 0.45–0.58 band**. The **threshold-as-logit-bias
+  lever was validated** (+0.045 / +0.064 / +0.073 free, runs 1/2/3). Epochs + capacity were the
+  dominant levers (0.189 → 0.341 → 0.433). Remaining headroom to the upper band (see `notes.md`):
+  5-fold + multi-seed bagging, loss A/B/C (ASL/DB), Small backbone, heavier aug — each ~+0.02–0.05
+  on OOF. The shipped `submission.csv` is reproduced by `solution.ipynb`.
 - **Key risks:**
   - *Loss conflict unresolved by external evidence* — BCE-beats-Focal data is HPA-specific;
     ASL/DB data is text-benchmark. **Must A/B on OOF.**
